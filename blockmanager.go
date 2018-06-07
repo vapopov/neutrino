@@ -6,6 +6,7 @@ import (
 	"container/list"
 	"fmt"
 	"math/big"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,7 +92,7 @@ type cfheadersMsg struct {
 // chain. This is kind of a hack until these get soft-forked in, but we do
 // verification to avoid getting bamboozled by malicious nodes.
 type processCFHeadersMsg struct {
-	earliestNode *headerNode
+	earliestNode headerNode
 	stopHash     chainhash.Hash
 	filterType   wire.FilterType
 }
@@ -329,6 +330,7 @@ func (b *blockManager) blockHandler() {
 	candidatePeers := list.New()
 out:
 	for {
+		nothing := false
 		// Check internal messages channel first and continue if
 		// there's nothing to process.
 		select {
@@ -336,12 +338,12 @@ out:
 			switch msg := m.(type) {
 			case *processCFHeadersMsg:
 				b.handleProcessCFHeadersMsg(msg)
-
 			default:
 				log.Warnf("Invalid message type in block "+
 					"handler: %T", msg)
 			}
 		default:
+			nothing = true
 		}
 
 		// Now check peer messages and quit channels.
@@ -349,18 +351,25 @@ out:
 		case m := <-b.peerChan:
 			switch msg := m.(type) {
 			case *newPeerMsg:
+				if nothing { fmt.Println("---- NOTHING - peer message ---") }
 				b.handleNewPeerMsg(candidatePeers, msg.peer)
 
 			case *invMsg:
+				if nothing { fmt.Println("---- NOTHING - inv message ---") }
 				b.handleInvMsg(msg)
 
 			case *headersMsg:
+				if nothing { fmt.Println("---- NOTHING - header -") }
+				fmt.Println("- header message ---", len(msg.headers.Headers))
 				b.handleHeadersMsg(msg)
 
 			case *cfheadersMsg:
+				if nothing { fmt.Println("---- NOTHING - cfheader -") }
+				fmt.Println("- cfheader message ---", len(msg.cfheaders.FilterHashes))
 				b.handleCFHeadersMsg(msg)
 
 			case *donePeerMsg:
+				if nothing { fmt.Println("---- NOTHING - done message ---") }
 				b.handleDonePeerMsg(candidatePeers, msg.peer)
 
 			case isCurrentMsg:
@@ -1307,8 +1316,8 @@ func (b *blockManager) handleCFHeadersMsg(cfhmsg *cfheadersMsg) {
 
 	// Go through each filter hash and calculate the header hash from it.
 	prevHeader := cfhmsg.cfheaders.PrevFilterHeader
-	respLen := len(cfhmsg.cfheaders.FilterHashes)
-	headerList := make([]chainhash.Hash, respLen)
+	filterHashesLen := len(cfhmsg.cfheaders.FilterHashes)
+	headerList := make([]chainhash.Hash, filterHashesLen)
 	for i, filterHash := range cfhmsg.cfheaders.FilterHashes {
 		headerList[i] = chainhash.DoubleHashH(append(filterHash[:],
 			prevHeader[:]...))
@@ -1317,9 +1326,15 @@ func (b *blockManager) handleCFHeadersMsg(cfhmsg *cfheadersMsg) {
 
 	// Find the block header matching the last filter header, if any.
 	el := b.headerList.Front()
+	//TODO: DEBUG:
+	fmt.Println("^^ start ^^ ", el.Value.(*headerNode).height)
+	//------------
 	for el != nil {
 		if el.Value.(*headerNode).header.BlockHash() ==
 			cfhmsg.cfheaders.StopHash {
+			//TODO: DEBUG:
+			fmt.Println("^^ end ^^ ", el.Value.(*headerNode).height, " - ", cfhmsg.cfheaders.StopHash)
+			//------------
 			break
 		}
 		el = el.Next()
@@ -1330,18 +1345,22 @@ func (b *blockManager) handleCFHeadersMsg(cfhmsg *cfheadersMsg) {
 		return
 	}
 
+	processed := 0
+
 	// Cycle through the filter header hashes and process them.
 	var node *headerNode
 	var hash chainhash.Hash
-	for i := respLen - 1; i >= 0 && el != nil; i-- {
+	for i := filterHashesLen - 1; i >= 0 && el != nil; i-- {
 		// If there's no map for this header, the header is either no
 		// longer valid or has already been processed and committed to
 		// the database. Either way, break processing.
 		node = el.Value.(*headerNode)
+
 		hash = node.header.BlockHash()
 		b.mapMutex.Lock()
 		if _, ok := headerMap[hash]; !ok {
 			b.mapMutex.Unlock()
+			//// ALARM!!! -
 			log.Tracef("Breaking at %d (%s)", node.height, hash)
 			break
 		}
@@ -1352,10 +1371,14 @@ func (b *blockManager) handleCFHeadersMsg(cfhmsg *cfheadersMsg) {
 		)
 		b.mapMutex.Unlock()
 		el = el.Prev()
+
+		processed++
 	}
 
+	fmt.Printf(">>> PROCESSED+++ %v, >> earliestNode: %v \n", processed, node.height)
+
 	b.intChan <- &processCFHeadersMsg{
-		earliestNode: node,
+		earliestNode: *node,
 		stopHash:     cfhmsg.cfheaders.StopHash,
 		filterType:   cfhmsg.cfheaders.FilterType,
 	}
@@ -1441,6 +1464,7 @@ func (b *blockManager) handleProcessCFHeadersMsg(msg *processCFHeadersMsg) {
 	// iterate through all of those headers, looking for conflicts. If we
 	// find a conflict, we have to do additional checks; otherwise, we
 	// write the filter header to the database.
+	fmt.Printf("===== :read: =====> %v \n", msg.earliestNode.height)
 	el := b.headerList.Front()
 	for el != nil {
 		node := el.Value.(*headerNode)
@@ -1461,6 +1485,7 @@ func (b *blockManager) handleProcessCFHeadersMsg(msg *processCFHeadersMsg) {
 						" for block %d (%s)",
 						node.height, hash)
 					b.mapMutex.Unlock()
+					os.Exit(1)
 					return
 				}
 
@@ -1484,7 +1509,7 @@ func (b *blockManager) handleProcessCFHeadersMsg(msg *processCFHeadersMsg) {
 							Height:     uint32(node.height),
 						})
 					processedHeaders = append(processedHeaders, header)
-
+					//fmt.Printf("===== :schedule: =====> %v \n", node.height)
 				}
 				*lastCFHeaderHeight = node.height
 				delete(headerMap, hash)
@@ -1513,6 +1538,11 @@ func (b *blockManager) handleProcessCFHeadersMsg(msg *processCFHeadersMsg) {
 
 	log.Tracef("Writing filter batch of %v filter headers",
 		len(headerWriteBatch))
+
+	if len(headerWriteBatch) > 0 {
+		fmt.Printf("===== :write last: =====> %v \n", headerWriteBatch[len(headerWriteBatch) - 1].Height)
+	}
+
 
 	// With all the headers in this batch validated, we'll write them all
 	// in a single transaction such that this entire batch is atomic.
